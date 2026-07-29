@@ -1,0 +1,57 @@
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Soul Sacrifice Card Game</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="title-screen" class="screen active">
+  <h1>Soul Sacrifice</h1>
+  <p>ブラウザで遊べるカードゲーム</p>
+  <button id="btn-start">START</button>
+</div>
+
+<div id="game-screen" class="screen">
+  <div class="status enemy">
+    <span>敵HP <b id="enemy-hp">20</b></span>
+    <span>魂 <b id="enemy-soul">0</b></span>
+    <span>山札 <b id="enemy-deck">0</b></span>
+  </div>
+
+  <div id="enemy-lanes" class="lanes"></div>
+
+  <div class="turnbar">
+    <span id="turn-label">ターン 1</span>
+    <span id="phase-label">ドロー</span>
+  </div>
+
+  <div id="player-lanes" class="lanes"></div>
+
+  <div class="status player">
+    <span>HP <b id="player-hp">20</b></span>
+    <span>魂 <b id="player-soul">0</b></span>
+    <span>山札 <b id="player-deck">0</b></span>
+  </div>
+
+  <div id="hand" class="hand"></div>
+
+  <div class="controls">
+    <button id="btn-draw">デッキから引く</button>
+    <button id="btn-scavenge">死体を漁る</button>
+    <button id="btn-end">ターン終了</button>
+  </div>
+
+  <div class="log">
+    <h3>ログ</h3>
+    <ul id="log-list"></ul>
+  </div>
+</div>
+
+<script src="cards.js"></script>
+<script src="script.js"></script>
+</body>
+</html>
