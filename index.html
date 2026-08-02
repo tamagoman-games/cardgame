@@ -1,0 +1,87 @@
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Soul Sacrifice Card Game</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="title-screen" class="screen active">
+  <h1>Soul Sacrifice</h1>
+  <p>ブラウザで遊べるカードゲーム</p>
+  <button id="btn-start">START</button>
+  <button id="btn-glossary-title" class="secondary">能力一覧</button>
+</div>
+
+<div id="deckbuilder-screen" class="screen">
+  <h2>デッキ編成</h2>
+  <p class="hint">カードの枚数を選んでください（<span id="deck-total">0</span> / <span id="deck-min">10</span>枚以上、最大<span id="deck-max">24</span>枚）</p>
+  <div id="deck-list" class="deck-list"></div>
+  <div class="controls two">
+    <button id="btn-deck-reset" class="secondary">おまかせ編成</button>
+    <button id="btn-deck-confirm">この編成でスタート</button>
+  </div>
+</div>
+
+<div id="game-screen" class="screen">
+  <div class="status enemy">
+    <span>敵HP <b id="enemy-hp">20</b></span>
+    <span>魂 <b id="enemy-soul">0</b></span>
+    <span>山札 <b id="enemy-deck">0</b></span>
+  </div>
+
+  <div id="enemy-lanes" class="lanes"></div>
+
+  <div class="turnbar">
+    <span id="turn-label">ターン 1</span>
+    <span id="phase-label">ドロー</span>
+    <button id="btn-glossary" class="mini">能力</button>
+  </div>
+
+  <div id="player-lanes" class="lanes"></div>
+
+  <div class="status player">
+    <span>HP <b id="player-hp">20</b></span>
+    <span>魂 <b id="player-soul">0</b></span>
+    <span>山札 <b id="player-deck">0</b></span>
+  </div>
+
+  <div id="sacrifice-banner" class="sacrifice-banner hidden"></div>
+
+  <div id="hand" class="hand"></div>
+
+  <div class="controls">
+    <button id="btn-draw">デッキから引く</button>
+    <button id="btn-scavenge">死体を漁る</button>
+    <button id="btn-end">ターン終了</button>
+  </div>
+
+  <div class="log">
+    <h3>ログ</h3>
+    <ul id="log-list"></ul>
+  </div>
+</div>
+
+<div id="result-screen" class="screen">
+  <h1 id="result-title">勝利</h1>
+  <p id="result-desc"></p>
+  <button id="btn-result-title">タイトルへ戻る</button>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<div id="glossary-modal" class="modal hidden">
+  <div class="modal-box">
+    <h3>能力一覧</h3>
+    <ul id="glossary-list" class="glossary-list"></ul>
+    <button id="btn-glossary-close">閉じる</button>
+  </div>
+</div>
+
+<script src="cards.js"></script>
+<script src="script.js"></script>
+</body>
+</html>
