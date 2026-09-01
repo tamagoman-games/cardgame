@@ -1,0 +1,427 @@
+
+:root{
+  --bg:#10131a;
+  --panel:#1b2230;
+  --panel2:#263146;
+  --border:#3d4b67;
+  --text:#f5f7ff;
+  --muted:#aab4cc;
+}
+
+*{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
+html,body{
+  margin:0;
+  width:100%;
+  max-width:100%;
+  overflow-x:hidden;
+  background:var(--bg);
+  color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Yu Gothic",sans-serif;
+}
+body{
+  overflow:hidden;
+}
+
+.screen{
+  display:none;position:fixed;inset:0;height:100dvh;overflow-y:auto;overflow-x:hidden;
+  max-width:100vw;
+  padding:16px;
+  padding-top:max(16px, env(safe-area-inset-top));
+  padding-bottom:max(16px, env(safe-area-inset-bottom));
+  padding-left:max(16px, env(safe-area-inset-left));
+  padding-right:max(16px, env(safe-area-inset-right));
+}
+.screen.active{display:block}
+
+#title-screen{
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  gap:16px;
+  text-align:center;
+}
+
+button{
+  background:var(--panel2);
+  color:var(--text);
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:12px 16px;
+  font-size:16px;
+  min-height:44px;
+  touch-action:manipulation;
+}
+
+.status,.turnbar{
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:10px 12px;
+  display:flex;
+  justify-content:space-between;
+  gap:8px;
+  flex-wrap:wrap;
+  margin-bottom:12px;
+}
+
+.lanes-wrap{
+  margin-bottom:12px;
+}
+
+.lanes{
+  display:grid;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:10px;
+  margin-bottom:12px;
+}
+
+.lane{
+  aspect-ratio:1 / 1;
+  min-width:0;
+  background:var(--panel);
+  border:2px dashed var(--border);
+  border-radius:16px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  text-align:center;
+  padding:8px;
+  overflow:hidden;
+  touch-action:manipulation;
+}
+
+.card{
+  width:100%;
+  min-width:0;
+  background:var(--panel2);
+  border:1px solid var(--border);
+  border-radius:12px;
+  padding:8px;
+  transition:transform .15s ease, box-shadow .15s ease;
+}
+
+.card .name{font-weight:700;margin-bottom:4px;overflow-wrap:break-word}
+.card .stats{font-size:13px;color:var(--muted);margin-bottom:4px}
+.card .abilities{display:flex;flex-wrap:wrap;gap:4px;justify-content:center}
+.badge{
+  background:#3a4a6b;
+  border-radius:999px;
+  padding:2px 8px;
+  font-size:11px;
+}
+
+.hand{
+  display:flex;
+  gap:10px;
+  overflow-x:auto;
+  overflow-y:visible;
+  padding:6px 4px 12px;
+  margin-bottom:12px;
+  -webkit-overflow-scrolling:touch;
+}
+
+.hand .card{
+  min-width:120px;
+  flex-shrink:0;
+  touch-action:manipulation;
+}
+
+/* 選択中の手札カードを拡大させて浮かせ、枠を光らせて分かりやすくする */
+.hand .card.selected{
+  transform:translateY(-10px) scale(1.06);
+  border-color:#6ea8ff;
+  box-shadow:0 0 0 3px #6ea8ff, 0 8px 18px rgba(110,168,255,0.5);
+  z-index:2;
+  position:relative;
+}
+
+.controls{
+  display:grid;
+  grid-template-columns:repeat(3,minmax(0,1fr));
+  gap:10px;
+  margin-bottom:16px;
+}
+.controls button{
+  min-width:0;
+  padding-left:6px;
+  padding-right:6px;
+  font-size:14px;
+}
+
+.log{
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:12px;
+}
+
+.log ul{
+  margin:0;
+  padding-left:20px;
+}
+
+.summonable{
+  border-color:#55d38a;
+}
+
+.enemy .lane{
+  border-style:solid;
+}
+
+/* ==================== 追加機能用スタイル ==================== */
+
+button.secondary{
+  background:transparent;
+  border:1px solid var(--muted);
+  color:var(--muted);
+}
+
+button.mini{
+  padding:6px 10px;
+  font-size:12px;
+  border-radius:10px;
+}
+
+button:disabled{
+  opacity:0.4;
+}
+
+.card .icon{margin-right:4px}
+
+.hint{color:var(--muted);font-size:13px;text-align:center}
+
+/* ---- デッキ編成画面 ---- */
+.deck-list{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  margin-bottom:16px;
+}
+
+.deck-row{
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:10px 12px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:10px;
+}
+
+.deck-row-info .name{font-weight:700}
+.deck-row-info .stats{font-size:12px;color:var(--muted);display:block;margin:2px 0}
+.deck-row-info .abilities{display:flex;gap:4px;flex-wrap:wrap}
+
+.stepper{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  flex-shrink:0;
+}
+.stepper button{
+  padding:6px 12px;
+  border-radius:10px;
+}
+.stepper .count{
+  min-width:20px;
+  text-align:center;
+  font-weight:700;
+}
+
+.controls.two{
+  grid-template-columns:repeat(2,1fr);
+}
+
+/* ---- 生け贄選択の表示 ---- */
+.sacrifice-banner{
+  background:#3a2233;
+  border:1px solid #8a4d6b;
+  border-radius:12px;
+  padding:8px 12px;
+  font-size:13px;
+  text-align:center;
+  margin-bottom:12px;
+}
+.sacrifice-banner.hidden{display:none}
+
+.lane.sac-selected{
+  border-color:#e0668a;
+  box-shadow:0 0 0 2px #e0668a inset;
+}
+
+/* ---- ターン表示バナー(「あなたのターン」「敵のターン」) ---- */
+.turn-banner{
+  position:fixed;
+  top:50%;
+  left:50%;
+  transform:translate(-50%,-50%) scale(0.85);
+  font-size:clamp(22px, 8vw, 34px);
+  font-weight:800;
+  color:var(--text);
+  background:rgba(10,14,22,0.88);
+  border:2px solid var(--border);
+  border-radius:20px;
+  padding:18px 32px;
+  z-index:80;
+  opacity:0;
+  pointer-events:none;
+  transition:opacity .25s ease, transform .25s ease;
+  text-align:center;
+  white-space:nowrap;
+}
+.turn-banner.show{
+  opacity:1;
+  transform:translate(-50%,-50%) scale(1);
+}
+.turn-banner.hidden{display:none}
+
+/* ---- 結果画面 ---- */
+#result-screen{
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+  gap:14px;
+  text-align:center;
+}
+#title-screen.active,
+#result-screen.active{display:flex}
+
+/* ---- トースト通知 ---- */
+.toast{
+  position:fixed;
+  left:50%;
+  bottom:24px;
+  transform:translateX(-50%);
+  background:#1b2230;
+  border:1px solid var(--border);
+  color:var(--text);
+  padding:10px 16px;
+  border-radius:999px;
+  font-size:13px;
+  opacity:0;
+  transition:opacity .2s ease;
+  z-index:50;
+}
+.toast.show{opacity:1}
+.toast.hidden{display:none}
+
+/* ---- 能力一覧モーダル ---- */
+.modal{
+  position:fixed;
+  inset:0;
+  background:rgba(0,0,0,0.6);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  z-index:60;
+  padding:20px;
+}
+.modal.hidden{display:none}
+.modal-box{
+  background:var(--panel);
+  border:1px solid var(--border);
+  border-radius:16px;
+  padding:16px;
+  max-width:420px;
+  width:100%;
+  max-height:80vh;
+  overflow-y:auto;
+}
+.glossary-list{
+  padding-left:18px;
+  margin:12px 0;
+  font-size:14px;
+  line-height:1.6;
+}
+
+/* 4スロット・2列フィールド */
+.field-row{margin-bottom:10px;}
+.row-label{font-size:12px;color:var(--muted);margin:0 0 4px 2px;}
+.field-row .lanes{grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:0;}
+.field-row .lane{font-size:12px;line-height:1.25;}
+.back-safe{border-color:#6ea8ff;box-shadow:0 0 0 2px rgba(110,168,255,.35) inset;}
+.safe-label{font-size:10px;color:#9fc4ff;margin-top:4px;}
+.field-row .card{padding:4px;display:flex;flex-direction:column;justify-content:center;gap:1px;}
+.field-row .card .name{font-size:12px;line-height:1.15;margin-bottom:1px;}
+.field-row .card .stats{font-size:10px;line-height:1.15;margin-bottom:1px;}
+.field-row .card .abilities{gap:2px;}
+.field-row .badge{font-size:9px;padding:1px 5px;}
+@media (max-width:520px){
+  .field-row .lane{padding:5px;}
+  .field-row .card{padding:3px;}
+  .field-row .card .name{font-size:11px;}
+  .field-row .card .stats{font-size:9px;}
+  .field-row .badge{font-size:8px;padding:0 4px;}
+}
+
+/* ---- 現在どちらのターンかを常に一目で分かるようにする ---- */
+.active-label{
+  font-weight:800;
+  padding:2px 10px;
+  border-radius:999px;
+  background:#2b3b58;
+  color:#9fc4ff;
+}
+.active-label.is-enemy{
+  background:#4a2436;
+  color:#ff9fb8;
+}
+
+/* ==================== 1列目(攻撃エリア) / 2列目(召喚エリア) の区別 ==================== */
+/* 1列目は召喚先として選べないので、空きマスは明確に「押せない」見た目にする */
+.player-lane.front-row.slot-empty.not-summonable{
+  cursor:not-allowed;
+  opacity:.55;
+  border-style:dashed;
+}
+/* 2列目の空きマスは召喚可能な場所だとひと目で分かるようにする */
+.player-lane.back-row.slot-empty.summonable-slot{
+  cursor:pointer;
+  border-color:#55d38a;
+  color:#8be8ae;
+  font-size:13px;
+}
+.enemy-lane.slot-empty{cursor:default;}
+/* 1列目(攻撃エリア)のラベルと2列目(召喚エリア)のラベルで色分け */
+.field-row:first-child .row-label{color:#ff9f7a;}
+.field-row:last-child .row-label{color:#8be8ae;}
+
+/* ---- 相手/自分のHP表示を一目で見分けられるようにする ----
+   相手情報は常に画面上側、自分情報は常に画面下側に表示される（HTML側の並び順で保証）。
+   ここでは色分けによって、スクロール中や一瞬見ただけでもどちらのHPか
+   迷わないようにする(特にiPhone Safariでの利用を想定)。 */
+.status-owner{
+  font-weight:800;
+  padding:2px 10px;
+  border-radius:999px;
+  align-self:center;
+}
+.status.enemy{
+  border-color:#8a4d5a;
+  background:#241820;
+}
+.status.enemy .status-owner{
+  background:#4a2436;
+  color:#ff9fb8;
+}
+.status.player{
+  border-color:#3f6a52;
+  background:#16241c;
+}
+.status.player .status-owner{
+  background:#1f4a34;
+  color:#7fe8ac;
+}
+
+/* Field capacity indicator */
+.field-count{
+  display:inline-block;
+  margin:4px 0 6px;
+  padding:4px 9px;
+  border:1px solid rgba(255,255,255,.16);
+  border-radius:8px;
+  font-size:12px;
+  font-weight:700;
+  opacity:.85;
+}
