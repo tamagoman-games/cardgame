@@ -1,0 +1,1706 @@
+const state = {
+  turn: 1,
+  phase: 'draw',
+  active: 'player',
+  logs: [],
+  selectedHand: null,
+  sacrificeTargets: [],
+  deckCounts: {},
+  player: null,
+  enemy: null,
+  locked: false, // ターン切り替え演出中などに操作を止めるためのフラグ
+  pendingSkeleton: null // ネクロマンサーのスケルトンをどこに出すか選んでいる最中かどうか('player'|'enemy'|null)
+};
+
+const $ = id => document.getElementById(id);
+
+function show(id){
+  document.querySelectorAll('.screen').forEach(el=>el.classList.remove('active'));
+  $(id).classList.add('active');
+}
+
+function log(msg){
+  state.logs.unshift(msg);
+  state.logs = state.logs.slice(0,30);
+  $('log-list').innerHTML = state.logs.map(x=>`<li>${x}</li>`).join('');
+}
+
+// ==== 一時的なメッセージ表示(操作できない理由をすぐに伝える) ====
+let toastTimer = null;
+function toast(msg){
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(()=>{
+    el.classList.remove('show');
+    el.classList.add('hidden');
+  }, 1600);
+}
+
+// ==== 簡易サウンド(WebAudio、素材不要のビープ音) ====
+let audioCtx = null;
+function initAudio(){
+  if(audioCtx) return;
+  try{
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }catch(e){
+    audioCtx = null;
+  }
+}
+function playSound(type){
+  if(!audioCtx) return;
+  const freqs = { summon:440, attack:260, sacrifice:180, death:200, win:660, lose:110 };
+  const freq = freqs[type] || 330;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = (type==='lose' || type==='death') ? 'sawtooth' : 'sine';
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(0.16, audioCtx.currentTime);
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime+0.35);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime+0.35);
+}
+
+// ==== ターン表示バナー(「あなたのターン」「敵のターン」を中央に大きく表示) ====
+let turnBannerHideTimer = null;
+let turnBannerCleanupTimer = null;
+function showTurnBanner(text){
+  const el = $('turn-banner');
+  clearTimeout(turnBannerHideTimer);
+  clearTimeout(turnBannerCleanupTimer);
+  el.textContent = text;
+  el.classList.remove('hidden');
+  // 一度リフローさせてからshowを付けることでアニメーションを確実に発火させる
+  requestAnimationFrame(()=>{
+    el.classList.add('show');
+  });
+  turnBannerHideTimer = setTimeout(()=>{
+    el.classList.remove('show');
+    turnBannerCleanupTimer = setTimeout(()=>{ el.classList.add('hidden'); }, 250);
+  }, 800);
+}
+
+function shuffle(arr){
+  const a=[...arr];
+  for(let i=a.length-1;i>0;i--){
+    const j=Math.floor(Math.random()*(i+1));
+    [a[i],a[j]]=[a[j],a[i]];
+  }
+  return a;
+}
+
+function cardName(id){
+  const c = CARD_MASTER.find(c=>c.id===id);
+  return c ? c.name : id;
+}
+
+function makeCard(id){
+  const base = CARD_MASTER.find(c=>c.id===id);
+  return {
+    uid: Math.random().toString(36).slice(2),
+    ...base,
+    currentHp: base.hp,
+    summonedThisTurn: true,
+    attacked: false,
+    revived: false
+  };
+}
+
+const FIELD_LANES = 4;
+const FIELD_SLOTS = 8;
+const FRONT_START = 0;
+const BACK_START = 4;
+// 【仕様変更】場の上限を4→6に変更(依頼により)。レーン数(FIELD_LANES=4)は変えず、
+// 1レーンあたり前列/後列の2枠(計8枠)の中で最大6体まで並べられるようにする。
+const MAX_FIELD_CARDS = 6;
+
+function frontIndex(lane){ return lane; }
+function backIndex(lane){ return BACK_START + lane; }
+function rowOf(index){ return index < BACK_START ? 'front' : 'back'; }
+function laneOf(index){ return index < BACK_START ? index : index - BACK_START; }
+function fieldCount(owner){ return owner.field.filter(Boolean).length; }
+
+// 2列目は完全な召喚待機エリアなので、攻撃側・防御側どちらの処理でも
+// 2列目のモンスターは一切参照しない(攻撃対象にもならないし、攻撃もしない)。
+function targetForAttack(owner, lane, flying=false){
+  const front = owner.field[frontIndex(lane)];
+
+  if(flying){
+    // 飛行は正面(1列目)に「守護」がいる時だけ足止めされる。2列目の守護は無視。
+    if(front && hasAbility(front,'守護')) return {card:front,index:frontIndex(lane)};
+    // 「身代わり」持ちが「守護」も併せ持つ場合は、レーンに関係なく飛行も食い止める。
+    const guardDecoy = frontRowAbilityHolder(owner, '身代わり', true);
+    if(guardDecoy) return guardDecoy;
+    return null;
+  }
+
+  // 通常攻撃は同レーンの1列目だけを見る。1列目が空いていれば2列目がいてもプレイヤーを攻撃する。
+  if(front) return {card:front,index:frontIndex(lane)};
+  // 1列目が空でも、「身代わり」持ちが他レーンの1列目にいれば、その代わりに攻撃を受ける。
+  const decoy = frontRowAbilityHolder(owner, '身代わり', false);
+  if(decoy) return decoy;
+  return null;
+}
+
+// 1列目にいる指定の能力持ちを探す(レーンを問わない)。
+// requireGuard=trueなら「守護」も併せ持つものだけを対象にする(飛行の足止め判定用)。
+// 複数いる場合は、より丈夫な(currentHpが高い)ものを優先して受けさせる。
+function frontRowAbilityHolder(owner, ability, requireGuard){
+  let best = null;
+  for(let lane=0; lane<FIELD_LANES; lane++){
+    const idx = frontIndex(lane);
+    const c = owner.field[idx];
+    if(!c || !hasAbility(c, ability)) continue;
+    if(requireGuard && !hasAbility(c,'守護')) continue;
+    if(!best || c.currentHp > best.card.currentHp) best = {card:c, index:idx};
+  }
+  return best;
+}
+
+// ターン終了時などに呼び、2列目のモンスターを同じレーンの1列目へ移動させる。
+// 1列目が空いているレーンだけ移動し、埋まっているレーンはそのまま2列目に残す
+// (次にそのレーンの1列目が空いたタイミングで、次回このゲームがadvanceRowを呼んだ時に移動する)。
+function advanceRow(owner, ownerLabel){
+  for(let lane=0; lane<FIELD_LANES; lane++){
+    const f = frontIndex(lane), b = backIndex(lane);
+    const backCard = owner.field[b];
+    if(backCard && !owner.field[f]){
+      owner.field[f] = backCard;
+      owner.field[b] = null;
+      backCard.summonedThisTurn = false;
+      log(`${ownerLabel}の「${backCard.name}」が1列目へ移動し、攻撃可能になった`);
+    }
+  }
+}
+
+function fieldSlots(owner){
+  return owner.field.map((c,index)=>({c,index})).filter(x=>x.c);
+}
+
+function createPlayer(deckIds){
+  const deck = shuffle(deckIds).map(makeCard);
+  const hand = [];
+  for(let i=0;i<3;i++) hand.push(deck.pop());
+  return {
+    hp:20,
+    soul:0,
+    deck,
+    hand,
+    field:Array(8).fill(null),
+    grave:[]
+  };
+}
+
+// ==================== デッキの保存/読み込み(ブラウザのlocalStorage) ====================
+const DECK_STORAGE_KEY = 'soulSacrifice_savedDeck';
+
+function saveDeckToStorage(counts){
+  try{
+    localStorage.setItem(DECK_STORAGE_KEY, JSON.stringify(counts));
+    return true;
+  }catch(e){
+    return false;
+  }
+}
+
+function loadDeckFromStorage(){
+  try{
+    const raw = localStorage.getItem(DECK_STORAGE_KEY);
+    if(!raw) return null;
+    const parsed = JSON.parse(raw);
+    if(!parsed || typeof parsed !== 'object') return null;
+    return parsed;
+  }catch(e){
+    return null;
+  }
+}
+
+// ==================== デッキ編成画面 ====================
+function renderDeckBuilder(){
+  $('deck-min').textContent = DECK_MIN_SIZE;
+  $('deck-max').textContent = DECK_MAX_SIZE;
+
+  $('deck-list').innerHTML = CARD_MASTER.map(card=>{
+    const count = state.deckCounts[card.id] || 0;
+    const sacText = card.sacrifice>0 ? ` / 生け贄${card.sacrifice}` : '';
+    const isSpell = card.type==='spell';
+    const statsText = isSpell ? `魔法 / 魂${card.soul}` : `ATK${card.atk}/HP${card.hp}/魂${card.soul}${sacText}`;
+    return `
+      <div class="deck-row${isSpell?' deck-row-spell':''}">
+        ${card.image ? `<img class="deck-row-thumb" src="${card.image}" alt="${card.name}">` : ''}
+        <div class="deck-row-info">
+          <span class="name">${card.name}</span>
+          <span class="stats">${statsText}</span>
+          <div class="abilities">${isSpell ? `<span class="spell-desc">${card.desc||''}</span>` : card.abilities.map(a=>`<span class="badge">${a}</span>`).join('')}</div>
+        </div>
+        <div class="stepper">
+          <button data-dec="${card.id}">−</button>
+          <span class="count">${count}</span>
+          <button data-inc="${card.id}">＋</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  const total = Object.values(state.deckCounts).reduce((a,b)=>a+b,0);
+  $('deck-total').textContent = total;
+  $('btn-deck-confirm').disabled = (total < DECK_MIN_SIZE || total > DECK_MAX_SIZE);
+
+  $('deck-list').querySelectorAll('[data-inc]').forEach(btn=>{
+    btn.onclick=()=>{
+      const id = btn.dataset.inc;
+      const cur = state.deckCounts[id] || 0;
+      const totalNow = Object.values(state.deckCounts).reduce((a,b)=>a+b,0);
+      if(cur >= MAX_COPIES_PER_CARD){ toast(`「${cardName(id)}」は最大${MAX_COPIES_PER_CARD}枚まで`); return; }
+      if(totalNow >= DECK_MAX_SIZE){ toast(`デッキは最大${DECK_MAX_SIZE}枚まで`); return; }
+      state.deckCounts[id] = cur + 1;
+      renderDeckBuilder();
+    };
+  });
+  $('deck-list').querySelectorAll('[data-dec]').forEach(btn=>{
+    btn.onclick=()=>{
+      const id = btn.dataset.dec;
+      const cur = state.deckCounts[id] || 0;
+      if(cur<=0) return;
+      state.deckCounts[id] = cur - 1;
+      renderDeckBuilder();
+    };
+  });
+}
+
+// ==================== 能力一覧モーダル ====================
+function renderGlossary(){
+  $('glossary-list').innerHTML = Object.keys(ABILITY_INFO).map(name=>`
+    <li><b>${name}</b> — ${ABILITY_INFO[name]}</li>
+  `).join('');
+}
+function openGlossary(){
+  renderGlossary();
+  $('glossary-modal').classList.remove('hidden');
+}
+function closeGlossary(){
+  $('glossary-modal').classList.add('hidden');
+}
+
+// ==================== ゲーム開始／終了 ====================
+// enemyDeckIdsを渡した場合はそのデッキを敵として使う(対人戦のゲスト側デッキ)。
+// 省略時は今まで通りAIの固定デッキを使う。
+function startGame(playerDeckIds, enemyDeckIds){
+  state.turn=1;
+  state.phase='draw';
+  state.active='player';
+  state.logs=[];
+  state.selectedHand=null;
+  state.sacrificeTargets=[];
+  state.locked=false;
+  state.pendingSkeleton=null;
+
+  state.player=createPlayer(playerDeckIds);
+  state.enemy=createPlayer(enemyDeckIds || countsToDeckIds(AI_DECK_COUNTS));
+
+  show('game-screen');
+  log(NET.mode==='host' ? 'ゲーム開始(対人戦)' : 'ゲーム開始');
+  render();
+  showTurnBanner('あなたのターン');
+}
+
+function endGame(result){
+  const title = $('result-title');
+  const desc = $('result-desc');
+  if(result==='win'){
+    title.textContent = '勝利！';
+    desc.textContent = '敵プレイヤーのHPを0にした！';
+    playSound('win');
+  }else if(result==='deckout'){
+    title.textContent = '敗北…';
+    desc.textContent = '山札が切れてしまった…';
+    playSound('lose');
+  }else{
+    title.textContent = '敗北…';
+    desc.textContent = 'HPが0になってしまった…';
+    playSound('lose');
+  }
+  show('result-screen');
+}
+
+// ==================== 描画 ====================
+// mode: 'field' = 場の正方形マス用(名前は省略しATK/HPのみ), 'hand' = 手札の正方形マス用(名前・魂コストも表示)
+function renderCard(card, {mode='field', extraClass='', dataAttr='', waiting=false}={}){
+  const isHand = mode==='hand';
+
+  // 魔法カードはATK/HPを持たないので専用の見た目で表示する(場に出ることは無いので
+  // 基本的にmode='hand'でしか呼ばれないが、念のためどのmodeでも安全に表示できるようにする)。
+  if(card.type==='spell'){
+    const cls = `card spell-card${extraClass?` ${extraClass}`:''}`;
+    return `
+      <div class="${cls}" ${dataAttr}>
+        <div class="name"><span class="icon">${card.icon||'✨'}</span>${card.name}</div>
+        <div class="spell-desc">${card.desc||''}</div>
+        <div class="stats">魂 ${card.soul}</div>
+      </div>
+    `;
+  }
+
+  const abilitiesHtml = card.abilities.map(a=>`<span class="badge">${a}</span>`).join('');
+  const waitBadge = waiting ? '<span class="badge wait-badge">待機中</span>' : '';
+  const cls = `card${card.image?' has-art':''}${extraClass?` ${extraClass}`:''}`;
+
+  if(card.image){
+    if(isHand){
+      // 手札の正方形マス用:画像いっぱいに敷き詰め、上に名前・下にATK/HPと魂コストを重ねる
+      const soulLine = `魂${card.soul}${card.sacrifice>0?`/贄${card.sacrifice}`:''}`;
+      return `
+        <div class="${cls}" ${dataAttr} style="background-image:url('${card.image}')">
+          <div class="card-name-ribbon">${card.name}</div>
+          <div class="card-overlay">
+            <div class="stats-mini">ATK${card.atk}/HP${card.currentHp} ${soulLine}</div>
+            <div class="abilities">${abilitiesHtml}</div>
+          </div>
+        </div>
+      `;
+    }
+    // 場の正方形マス用:画像を敷き詰めて、下部にATK/HPと能力だけ重ねて表示
+    return `
+      <div class="${cls}" ${dataAttr} style="background-image:url('${card.image}')">
+        <div class="card-overlay">
+          <div class="stats-mini">ATK ${card.atk} / HP ${card.currentHp}</div>
+          <div class="abilities">${abilitiesHtml}${waitBadge}</div>
+        </div>
+      </div>
+    `;
+  }
+  // 画像が無いカード:場・手札どちらも同じ正方形の中に名前+ステータスを小さく収める
+  return `
+    <div class="${cls}" ${dataAttr}>
+      <div class="name"><span class="icon">${card.icon||''}</span>${card.name}</div>
+      <div class="stats">ATK ${card.atk} / HP ${card.currentHp}</div>
+      <div class="stats">魂 ${card.soul}${card.sacrifice>0?` / 生け贄${card.sacrifice}`:''}</div>
+      <div class="abilities">${abilitiesHtml}${waitBadge}</div>
+    </div>
+  `;
+}
+
+// ---- 場に出た直後のカードだけ、短い時間だけ「召喚モーション」のクラスを付ける ----
+function justSummonedClass(card){
+  return (card._summonedAt && (Date.now() - card._summonedAt) < 500) ? 'summon-pop' : '';
+}
+
+function renderField(targetId, owner, enemy=false){
+  const attackRow = {label:'1列目：攻撃エリア', start:FRONT_START, isBack:false};
+  const summonRow = {label:'2列目：召喚エリア', start:BACK_START, isBack:true};
+  // 相手側だけ表示順を入れ替え、召喚エリアを上・攻撃エリアを下(=ターン表示バーに近い側)にする。
+  // これにより画面中央で相手の攻撃エリアと自分の攻撃エリアが向かい合う形になり、盤面が見やすくなる。
+  const rows = enemy ? [summonRow, attackRow] : [attackRow, summonRow];
+  // 選択中の手札カード(魔法・モンスター共通)。魔法カードは自分の場・相手の場
+  // どちらを対象にするかがカードごとに違うので、enemyの真偽に関わらず一度だけ取得する。
+  const selectedHandCard = (state.phase==='main' && !state.locked && state.selectedHand)
+    ? state.player.hand.find(c=>c.uid===state.selectedHand)
+    : null;
+
+  // 自分の場で、今まさに手札のモンスターを召喚できる状態かどうか(魔法カード選択中は対象外)
+  const selecting = !enemy && !!selectedHandCard && selectedHandCard.type!=='spell';
+  const selectedCard = selecting ? selectedHandCard : null;
+  const isSacrificing = !!(selectedCard && selectedCard.sacrifice>0);
+
+  // 魔法カードを選択中で、かつ今描画している側(自分/相手)がその魔法の対象になり得るか
+  const spellCard = (selectedHandCard && selectedHandCard.type==='spell') ? selectedHandCard : null;
+  const spellTargetsThisSide = !!(spellCard && (spellCard.target==='enemy' ? enemy : !enemy));
+
+  $(targetId).innerHTML = rows.map(row=>{
+    const cells = Array.from({length:FIELD_LANES},(_,lane)=>{
+      const index = row.start + lane;
+      const card = owner.field[index];
+      let cls = enemy ? 'lane enemy-lane' : 'lane player-lane';
+      cls += row.isBack ? ' back-row' : ' front-row';
+      if(!enemy && state.sacrificeTargets.includes(index)) cls += ' sac-selected';
+
+      if(!card){
+        // 空きマス:2列目は召喚可能、1列目は召喚不可(移動でしか埋まらない)
+        if(!enemy && row.isBack){
+          cls += ' slot-empty summonable-slot';
+          let label = '空き(召喚エリア)';
+          if(state.pendingSkeleton==='player') label = 'スケルトンをここに召喚';
+          else if(selecting && !isSacrificing) label = 'ここに召喚';
+          return `<div class="${cls}" data-slot="${index}">${label}</div>`;
+        }
+        cls += ' slot-empty not-summonable';
+        return `<div class="${cls}" data-slot="${index}">空き<br>(召喚不可)</div>`;
+      }
+
+      const waiting = row.isBack; // 2列目にいる間は常に攻撃不可・被攻撃不可
+      if(spellTargetsThisSide && (spellCard.target!=='allyBack' || row.isBack)){
+        cls += ' spell-targetable';
+      }
+      return `<div class="${cls}${waiting?' back-safe':''}" data-slot="${index}">${renderCard(card, {mode:'field', waiting, extraClass: justSummonedClass(card)})}</div>`;
+    }).join('');
+    return `<div class="field-row ${row.isBack?'summon-row':'attack-row'}"><div class="row-label">${row.label}</div><div class="lanes">${cells}</div></div>`;
+  }).join('');
+}
+function renderHand(){
+  $('hand').innerHTML = state.player.hand.map(card=>renderCard(card, {
+    mode: 'hand',
+    extraClass: state.selectedHand===card.uid ? 'selected' : '',
+    dataAttr: `data-hand="${card.uid}"`
+  })).join('');
+
+  document.querySelectorAll('[data-hand]').forEach(el=>{
+    el.onclick=()=>{
+      if(state.locked) return; // 敵ターン演出中は手札を操作できないようにする
+      if(NET.mode==='host' && state.active!=='player') return; // 対人戦: ゲストのターン中はホストの手札操作を禁止
+      if(state.pendingSkeleton==='player'){ toast('先にスケルトンの召喚場所を選んでください'); return; }
+      const uid = el.dataset.hand;
+      const card = state.player.hand.find(c=>c.uid===uid);
+
+      // 対象を選ばない魔法(魂の奔流など)は、タップした瞬間に即発動する
+      if(card && card.type==='spell' && card.target==='none'){
+        if(state.phase!=='main'){ toast('ドローかスカベンジを先に行ってください'); return; }
+        const idx = state.player.hand.findIndex(c=>c.uid===uid);
+        tryPlayerCastSpell(card, idx, 'none', -1);
+        return;
+      }
+
+      if(state.selectedHand===uid){
+        state.selectedHand=null;
+        state.sacrificeTargets=[];
+      }else{
+        state.selectedHand=uid;
+        state.sacrificeTargets=[];
+        if(card && card.type==='spell'){
+          const hint = card.target==='enemy' ? '敵のモンスターをタップして対象を選んでください'
+            : card.target==='allyBack' ? '2列目の自分のモンスターをタップして対象を選んでください'
+            : '自分のモンスターをタップして対象を選んでください';
+          log(hint);
+          toast(hint);
+        }else if(card && card.sacrifice>0){
+          toast(`生け贄が${card.sacrifice}体必要です`);
+        }else{
+          log('召喚するレーンをタップ');
+        }
+      }
+      render();
+    };
+  });
+}
+
+// 「供物」を持つカードは1体で生け贄2体分として数える(プレイヤー・AI共通で使う)
+// 「不死」を持つカードは、生け贄に選ばれた場合も戦闘と同じく1回だけ発動する。
+// 発動した(まだ復活していない)1回目は生け贄コストとしてはきちんとカウントされる
+// (=生け贄には使える)が、実際には場から離れずHP満タンで復活する。
+// つまりゾンビは「1回目:生け贄コストを払いつつ生き残る」「2回目:通常どおり場を離れて
+// 生け贄になる」の合計2回、生け贄として使えることになる。
+function sacrificeUnitValue(card){
+  return hasAbility(card, '供物') ? 2 : 1;
+}
+// 生け贄に選んだカードのうち、実際に場から離れて生け贄になる(不死がまだ発動していない
+// カードは場に残るので除く)枚数。場の上限体数制限の判定で「本当に空くマス数」を数えるために使う。
+function sacrificeConsumedCount(lanes, owner){
+  return lanes.filter(l=>{
+    const c = owner.field[l];
+    return c && !(hasAbility(c,'不死') && !c.revived);
+  }).length;
+}
+function sacrificeValue(lanes, owner){
+  return lanes.reduce((sum, l)=>{
+    const c = owner.field[l];
+    if(!c) return sum;
+    return sum + sacrificeUnitValue(c);
+  }, 0);
+}
+
+// AIが生け贄を選ぶ処理(HPが低い順に、必要な価値を満たすまで選ぶ)。
+// 「見積もり(何体生け贄になるか)」と「実際に生け贄を捧げる処理」の両方で
+// この関数を使うことで、2箇所の処理がズレて場の上限チェックが狂うのを防ぐ。
+function pickSacrifices(owner, excludeIndex, neededValue){
+  const candidates = fieldSlots(owner)
+    .filter(o=>o.index!==excludeIndex)
+    .sort((a,b)=>a.c.currentHp-b.c.currentHp);
+  const chosen = [];
+  let value = 0;
+  for(const cand of candidates){
+    if(value>=neededValue) break;
+    chosen.push(cand);
+    value += sacrificeUnitValue(cand.c);
+  }
+  return { chosen, value, enough: value>=neededValue };
+}
+
+function updateSacrificeBanner(){
+  const banner = $('sacrifice-banner');
+  const card = state.selectedHand ? state.player.hand.find(c=>c.uid===state.selectedHand) : null;
+  if(!card || card.sacrifice<=0){
+    banner.classList.add('hidden');
+    return;
+  }
+  banner.classList.remove('hidden');
+  const value = sacrificeValue(state.sacrificeTargets, state.player);
+  banner.textContent = `生け贄 ${value} / ${card.sacrifice} 選択中(自分の場のカードをタップして選択→空きマスをタップで召喚)`;
+}
+
+function render(){
+  $('player-hp').textContent=state.player.hp;
+  $('enemy-hp').textContent=state.enemy.hp;
+  $('player-soul').textContent=state.player.soul;
+  $('enemy-soul').textContent=state.enemy.soul;
+  $('player-deck').textContent=state.player.deck.length;
+  $('enemy-deck').textContent=state.enemy.deck.length;
+  const playerFieldCount = fieldCount(state.player);
+  const enemyFieldCount = fieldCount(state.enemy);
+  const pfc = $('player-field-count');
+  const efc = $('enemy-field-count');
+  if(pfc) pfc.textContent = `場 ${playerFieldCount} / ${MAX_FIELD_CARDS}`;
+  if(efc) efc.textContent = `場 ${enemyFieldCount} / ${MAX_FIELD_CARDS}`;
+  $('turn-label').textContent=`ターン ${state.turn}`;
+  $('phase-label').textContent=state.phase==='draw'?'ドロー':'メイン';
+  const activeLabel = $('active-label');
+  const isEnemyActive = state.locked || state.active==='enemy';
+  const enemyLabel = (NET.mode==='host' || NET.mode==='guest') ? '相手の番' : '敵の番';
+  activeLabel.textContent = isEnemyActive ? enemyLabel : 'あなたの番';
+  activeLabel.classList.toggle('is-enemy', isEnemyActive);
+
+  renderField('enemy-lanes', state.enemy, true);
+  renderField('player-lanes', state.player);
+  renderHand();
+  updateSacrificeBanner();
+
+  // ドロー/死体を漁るはどちらか1回のみ、ターン切り替え演出中は全操作を止める。
+  // 対人戦ホストは、ゲストのターン中(state.active!=='player')は
+  // state.locked が false でも自分のボタンは押せないようにする
+  // (state.locked はゲストの操作を受け付けるために解放されているだけなので)。
+  const hostOffTurn = NET.mode==='host' && state.active!=='player';
+  $('btn-draw').disabled = state.phase!=='draw' || state.locked || hostOffTurn || state.pendingSkeleton==='player';
+  $('btn-scavenge').disabled = state.phase!=='draw' || state.locked || hostOffTurn || state.pendingSkeleton==='player';
+  $('btn-end').disabled = state.phase!=='main' || state.locked || hostOffTurn || state.pendingSkeleton==='player';
+
+  document.querySelectorAll('.player-lane').forEach(el=>{
+    el.onclick=()=>onPlayerLane(Number(el.dataset.slot));
+  });
+  document.querySelectorAll('.enemy-lane').forEach(el=>{
+    el.onclick=()=>onEnemyLane(Number(el.dataset.slot));
+  });
+
+  if(NET.mode==='host') broadcastView();
+}
+
+// ==================== プレイヤー操作 ====================
+function onPlayerLane(slot){
+  if(state.locked) return;
+  if(NET.mode==='host' && state.active!=='player') return; // 対人戦: ゲストのターン中はホストの召喚操作を禁止
+
+  if(state.pendingSkeleton==='player'){
+    if(state.player.field[slot] || rowOf(slot)!=='back'){
+      toast('空いている召喚エリアを選んでください');
+      return;
+    }
+    if(NET.mode==='guest'){
+      // ゲスト側は実際の配置をホストに任せ、意図だけを送る
+      netSend({t:'skeletonPick', slot});
+      return;
+    }
+    const skeleton = makeCard('skeleton');
+    skeleton._summonedAt = Date.now();
+    state.player.field[slot] = skeleton;
+    state.pendingSkeleton = null;
+    log('あなたの「ネクロマンサー」が「スケルトン」を召喚');
+    playSound('summon');
+    render();
+    return;
+  }
+
+  if(state.phase!=='main'){
+    toast('ドローかスカベンジを先に行ってください');
+    return;
+  }
+  if(!state.selectedHand) return;
+
+  const idx = state.player.hand.findIndex(c=>c.uid===state.selectedHand);
+  if(idx===-1) return;
+  const card = state.player.hand[idx];
+
+  if(card.type==='spell'){
+    tryPlayerCastSpell(card, idx, 'own', slot);
+    return;
+  }
+
+  const occupied = !!state.player.field[slot];
+
+  if(occupied){
+    if(card.sacrifice<=0) return;
+    if(state.sacrificeTargets.includes(slot)){
+      state.sacrificeTargets = state.sacrificeTargets.filter(l=>l!==slot);
+    }else{
+      const currentValue = sacrificeValue(state.sacrificeTargets, state.player);
+      if(currentValue>=card.sacrifice){
+        toast('生け贄はもう十分選んでいます');
+        return;
+      }
+      state.sacrificeTargets.push(slot);
+    }
+    render();
+    return;
+  }
+
+  if(rowOf(slot)!=='back'){
+    toast('モンスターは2列目(召喚エリア)にのみ召喚できます');
+    return;
+  }
+  // 生け贄で場のカードが減る分は先に差し引いてから上限体数の制限を判定する。
+  // (そうしないと、場が上限の時に「1体を生け贄にして別の1体を出す」入れ替えができなくなってしまう)
+  // 「不死」がまだ発動していないカードは、生け贄に選ばれても場に残る(復活する)ので、
+  // sacrificeConsumedCount で「本当に離脱する枚数」だけを差し引く。
+  const projectedFieldCount = fieldCount(state.player) - sacrificeConsumedCount(state.sacrificeTargets, state.player);
+  if(projectedFieldCount>=MAX_FIELD_CARDS){
+    toast(`場には${MAX_FIELD_CARDS}体までしか出せません`);
+    return;
+  }
+  if(card.sacrifice>0 && sacrificeValue(state.sacrificeTargets, state.player) < card.sacrifice){
+    toast(`先に生け贄を${card.sacrifice}体選んでください`);
+    return;
+  }
+  if(state.player.soul < card.soul){
+    toast('魂が足りない');
+    log('魂が足りない');
+    return;
+  }
+
+  if(NET.mode==='guest'){
+    // 対人戦のゲスト側は実際の召喚処理をホストに任せ、意図だけを送る
+    netSend({t:'summon', slot, handUid:card.uid, sacrifice:[...state.sacrificeTargets]});
+    state.selectedHand=null;
+    state.sacrificeTargets=[];
+    render();
+    return;
+  }
+
+  if(card.sacrifice>0){
+    const sacrificedNames = [];
+    state.sacrificeTargets.forEach(slot=>{
+      const sacCard = state.player.field[slot];
+      if(sacCard){
+        if(hasAbility(sacCard, '不死') && !sacCard.revived){
+          sacCard.currentHp = sacCard.hp;
+          sacCard.revived = true;
+          log(`「${sacCard.name}」を生け贄に捧げたが、不死が発動して場に残った`);
+        }else{
+          state.player.field[slot]=null;
+          state.player.grave.push(sacCard);
+          const soulAmount = gainSoulOnDeath(sacCard, state.player);
+          triggerOnDeath(sacCard, state.player, slot);
+          sacrificedNames.push(sacCard.name);
+          log(`生け贄「${sacCard.name}」で魂+${soulAmount}`);
+        }
+      }
+    });
+    if(sacrificedNames.length) log(`「${sacrificedNames.join('」「')}」を生け贄に捧げた`);
+    playSound('sacrifice');
+  }
+
+  state.player.soul -= card.soul;
+  state.player.hand.splice(idx,1);
+  card._summonedAt = Date.now();
+  state.player.field[slot]=card;
+  state.selectedHand=null;
+  state.sacrificeTargets=[];
+  log(`「${card.name}」を${rowOf(slot)==='back'?'2列目':'1列目'}に召喚`);
+  playSound('summon');
+  triggerOnSummon(card, state.player, slot);
+  render();
+}
+// ==================== 魔法カード ====================
+// モンスターと違い場に残らず、使った瞬間に効果を発動してそのまま手札から消える。
+// casterOwner: 唱えた側(player/enemyオブジェクト)、opponentOwner: その相手側。
+// targetSlot: 対象の場のインデックス(target:'none'の魔法では使わないので-1でよい)。
+// 戻り値: 発動できればtrue、対象が既に居ないなど不正な場合はfalse。
+function applySpellEffect(card, casterOwner, opponentOwner, targetSlot){
+  const casterLabel = (casterOwner===state.player) ? 'あなた' : '敵';
+  switch(card.effect){
+    case 'buff': {
+      const target = casterOwner.field[targetSlot];
+      if(!target) return false;
+      const addAtk = (card.value && card.value.atk) || 0;
+      const addHp = (card.value && card.value.hp) || 0;
+      target.atk += addAtk;
+      target.hp += addHp;
+      target.currentHp += addHp;
+      log(`${casterLabel}が「${card.name}」で「${target.name}」をATK+${addAtk}/HP+${addHp}`);
+      return true;
+    }
+    case 'rush': {
+      const target = casterOwner.field[targetSlot];
+      if(!target || rowOf(targetSlot)!=='back') return false;
+      const lane = laneOf(targetSlot);
+      const front = frontIndex(lane);
+      if(casterOwner.field[front]) return false; // 1列目が空いていないと移動できない
+      casterOwner.field[front] = target;
+      casterOwner.field[targetSlot] = null;
+      target.summonedThisTurn = false;
+      target._summonedAt = Date.now();
+      log(`${casterLabel}が「${card.name}」で「${target.name}」を即座に1列目へ移動させた`);
+      return true;
+    }
+    case 'damage': {
+      const target = opponentOwner.field[targetSlot];
+      if(!target) return false;
+      let dmg = card.value;
+      if(hasAbility(target,'装甲')) dmg = Math.max(0, dmg-1);
+      target.currentHp -= dmg;
+      log(`${casterLabel}が「${card.name}」で「${target.name}」に${dmg}ダメージ`);
+      if(target.currentHp<=0) resolveDeath(target, opponentOwner, targetSlot);
+      return true;
+    }
+    case 'soulGain': {
+      const amount = card.value || 0;
+      casterOwner.soul += amount;
+      log(`${casterLabel}が「${card.name}」で魂+${amount}`);
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+// プレイヤーが魔法カードを使おうとした時の共通処理(対象の妥当性チェック→コスト消費→発動)。
+// side: 'own'(自分の場を対象) / 'enemy'(敵の場を対象) / 'none'(対象不要、即時発動)
+function tryPlayerCastSpell(card, idx, side, slot){
+  if(card.target==='ally' && side!=='own'){ toast('自分のモンスターを選んでください'); return false; }
+  if(card.target==='allyBack' && side!=='own'){ toast('自分のモンスターを選んでください'); return false; }
+  if(card.target==='enemy' && side!=='enemy'){ toast('敵のモンスターを選んでください'); return false; }
+
+  if(card.target!=='none'){
+    const fieldOwner = side==='own' ? state.player : state.enemy;
+    if(typeof slot!=='number' || !fieldOwner.field[slot]){ toast('モンスターがいるマスを選んでください'); return false; }
+    if(card.target==='allyBack'){
+      if(rowOf(slot)!=='back'){ toast('2列目の自分のモンスターを選んでください'); return false; }
+      const lane = laneOf(slot);
+      if(state.player.field[frontIndex(lane)]){ toast('1列目が空いていないと移動できません'); return false; }
+    }
+  }
+
+  if(state.player.soul < card.soul){ toast('魂が足りない'); log('魂が足りない'); return false; }
+
+  if(NET.mode==='guest'){
+    netSend({t:'spell', handUid:card.uid, side, slot: (typeof slot==='number'?slot:-1)});
+    state.selectedHand=null;
+    render();
+    return true;
+  }
+
+  const ok = applySpellEffect(card, state.player, state.enemy, slot);
+  if(!ok){ toast('発動できませんでした'); return false; }
+  state.player.soul -= card.soul;
+  state.player.hand.splice(idx,1);
+  state.selectedHand=null;
+  playSound('summon');
+  render();
+  return true;
+}
+
+// 敵の場のマスをタップした時の処理。今のところ「敵モンスターを対象にする魔法カード」を
+// 選んでいる時だけ意味を持つ(それ以外の時にタップしても何も起きない)。
+function onEnemyLane(slot){
+  if(state.locked) return;
+  if(NET.mode==='host' && state.active!=='player') return;
+  if(state.pendingSkeleton==='player') return;
+  if(state.phase!=='main') return;
+  if(!state.selectedHand) return;
+
+  const idx = state.player.hand.findIndex(c=>c.uid===state.selectedHand);
+  if(idx===-1) return;
+  const card = state.player.hand[idx];
+  if(card.type!=='spell') return;
+  tryPlayerCastSpell(card, idx, 'enemy', slot);
+}
+
+function drawCard(){
+  if(NET.mode==='guest'){
+    if(state.locked || state.phase!=='draw' || state.pendingSkeleton==='player') return;
+    netSend({t:'draw'});
+    return;
+  }
+  if(state.locked) return;
+  if(NET.mode==='host' && state.active!=='player') return; // 対人戦: ゲストのターン中はホストのドローを禁止
+  if(state.pendingSkeleton==='player') return; // スケルトンの配置待ち中は他の操作を禁止
+  if(state.phase!=='draw') return;
+
+  if(state.player.deck.length===0){
+    endGame('deckout');
+    return;
+  }
+
+  if(state.player.hand.length>=HAND_LIMIT){
+    toast('手札上限です');
+    log('手札上限');
+    state.phase='main';
+    render();
+    return;
+  }
+
+  state.player.hand.push(state.player.deck.pop());
+  state.phase='main';
+  log('1枚ドロー');
+  render();
+}
+
+function scavenge(){
+  if(NET.mode==='guest'){
+    if(state.locked || state.phase!=='draw' || state.pendingSkeleton==='player') return;
+    netSend({t:'scavenge'});
+    return;
+  }
+  if(state.locked) return;
+  if(NET.mode==='host' && state.active!=='player') return; // 対人戦: ゲストのターン中はホストのスカベンジを禁止
+  if(state.pendingSkeleton==='player') return; // スケルトンの配置待ち中は他の操作を禁止
+  if(state.phase!=='draw') return;
+  state.player.soul += 1;
+  state.phase='main';
+  log('死体を漁って魂 +1');
+  render();
+}
+
+// ==================== 召喚時／死亡時能力の土台 ====================
+// 今はまだ何も発動しないが、将来「召喚時」に発動する能力を追加しやすいように
+// カードを場に出すたびに必ずこの関数を通す。
+function triggerOnSummon(card, owner, slot){
+  if(!card || !Array.isArray(card.abilities)) return;
+  card.abilities.forEach(ability=>{
+    switch(ability){
+      case '召喚時': {
+        if(card.id==='necromancer' && fieldCount(owner)<MAX_FIELD_CARDS){
+          // スケルトンも2列目にしか召喚できない
+          const emptySlots = owner.field
+            .map((c,idx)=>idx)
+            .filter(idx=>!owner.field[idx] && rowOf(idx)==='back');
+          // 実際に操作している人間(自分、または対人戦の相手)が選べるかどうか
+          const isHumanOwner = (owner===state.player) || (owner===state.enemy && NET.mode==='host');
+          if(emptySlots.length>1 && isHumanOwner){
+            // 空きが複数ある場合は、出す場所を選べるようにする(選択結果はview同期で相手にも伝わる)
+            state.pendingSkeleton = (owner===state.player) ? 'player' : 'enemy';
+            log(`${owner===state.player?'あなた':'敵'}の「ネクロマンサー」がスケルトンを呼び出そうとしている(空きマスを選択)`);
+            if(owner===state.player) toast('スケルトンを召喚する場所を選んでください');
+          }else if(emptySlots.length>0){
+            const empty = emptySlots[0];
+            const skeleton = makeCard('skeleton');
+            skeleton._summonedAt = Date.now();
+            owner.field[empty]=skeleton;
+            log(`${owner===state.player?'あなた':'敵'}の「ネクロマンサー」が「スケルトン」を召喚`);
+            playSound('summon');
+          }
+        }
+        break;
+      }
+      case '知識': {
+        if(owner.deck.length>0 && owner.hand.length<HAND_LIMIT){
+          owner.hand.push(owner.deck.pop());
+          log(`${owner===state.player?'あなた':'敵'}の「${card.name}」の「知識」でカードを1枚引いた`);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  });
+}
+
+// 今はまだ何も発動しないが、将来「死亡時」に発動する能力を追加しやすいように
+// カードが場から墓地に行くたびに必ずこの関数を通す(不死で復活した場合は呼ばれない)。
+function triggerOnDeath(card, owner, lane){
+  if(!card || !Array.isArray(card.abilities)) return;
+  card.abilities.forEach(ability=>{
+    switch(ability){
+      case '断末魔': {
+        if(owner.deck.length>0 && owner.hand.length<HAND_LIMIT){
+          owner.hand.push(owner.deck.pop());
+          log(`${owner===state.player?'あなた':'敵'}の「${card.name}」の「断末魔」でカードを1枚引いた`);
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  });
+}
+
+// ==================== 魂獲得・死亡処理 ====================
+// 「魂収集」を持つカードは通常の1個ではなく2個の魂を持ち主に与える
+function gainSoulOnDeath(card, owner){
+  const amount = hasAbility(card, '魂収集') ? 2 : 1;
+  owner.soul += amount;
+  return amount;
+}
+
+// カードのHPが0以下になった時の処理(不死の復活 or 死亡)をowner/lane付きで一元管理する。
+// これにより「誰の場のカードか」を取り違えるバグを防ぐ。
+function resolveDeath(card, owner, lane){
+  if(hasAbility(card, '不死') && !card.revived){
+    card.currentHp = card.hp;
+    card.revived = true;
+    log(`「${card.name}」が不死で復活`);
+    return;
+  }
+  owner.field[lane] = null;
+  owner.grave.push(card);
+  const amount = gainSoulOnDeath(card, owner);
+  const who = (owner===state.player) ? 'あなた' : '敵';
+  log(`「${card.name}」が倒れた(${who}の魂+${amount})`);
+  playSound('death');
+  triggerOnDeath(card, owner, lane);
+}
+
+
+
+// ==================== 敵AI ====================
+// このゲームのルール(3レーン、2列目にしか召喚できない、召喚したターンは攻撃不可、
+// 場は合計MAX_FIELD_CARDS体まで、ドロー/死体を漁るはどちらか1回、手札上限8、突進なし、など)は
+// 一切変更しない。AIはその範囲内で「状況を見て少し賢く動く」ことだけを行う。
+//
+// 実装方針:
+//  1. enemyChooseDrawOrScavenge : ドロー / 死体を漁る のどちらが良いかを状況から判断
+//  2. evaluateSummonOption      : 手札のカード×召喚先レーンの組み合わせを評価してスコア化
+//  3. pickSacrificesForAI       : 生け贄が必要な時、守護や毒など価値の高いカードを
+//                                  なるべく残しつつ選ぶ
+//  (攻撃の処理順は、AIも含めて常にレーン0→3の左から右の固定順。理由はresolveAttackPhase
+//   直前のコメントを参照)
+// 完全な最適解の計算は行わず、あくまで「今の場を見て有利な方を選ぶ」程度にとどめる。
+
+// ---- 場のカード1体のおおよその強さを数値化する(評価の基準として使う) ----
+function cardPower(card){
+  let v = card.atk + card.currentHp*0.5;
+  if(hasAbility(card,'守護')) v += 2;
+  if(hasAbility(card,'毒')) v += 2;
+  if(hasAbility(card,'貫通')) v += 1.5;
+  if(hasAbility(card,'2連撃')) v += 2;
+  if(hasAbility(card,'飛行')) v += 1;
+  if(hasAbility(card,'装甲')) v += 1;
+  if(hasAbility(card,'不死')) v += 1.5;
+  if(hasAbility(card,'魂収集')) v += 0.5;
+  if(hasAbility(card,'魂喰らい')) v += 1;
+  if(hasAbility(card,'使役')) v += 1.5;
+  if(hasAbility(card,'身代わり')) v += 2.5; // レーンを問わず直接攻撃を肩代わりできる高耐久の壁
+  if(hasAbility(card,'断末魔')) v += 1;     // 死んだ時にカード1枚分の価値を回収できる
+  return v;
+}
+
+// ---- 相手(attackerOwner)の飛行が直接攻撃できてしまう、defenderOwner側の危険レーン一覧 ----
+// (そのレーンのdefenderOwner側1列目に守護がいなければ、飛行に直接攻撃される)
+function flyingThreatLanes(defenderOwner, attackerOwner){
+  // 「身代わり」+「守護」を併せ持つカードが1列目にいれば、レーンを問わず飛行を止められるので
+  // 危険レーンは無い扱いにする。
+  if(frontRowAbilityHolder(defenderOwner, '身代わり', true)) return [];
+  const lanes = [];
+  for(let lane=0; lane<FIELD_LANES; lane++){
+    const atk = attackerOwner.field[frontIndex(lane)];
+    if(atk && hasAbility(atk,'飛行')){
+      const myFront = defenderOwner.field[frontIndex(lane)];
+      if(!myFront || !hasAbility(myFront,'守護')) lanes.push(lane);
+    }
+  }
+  return lanes;
+}
+
+// ---- ドロー / 死体を漁る の判断 ----
+// プレイヤーと同じく、このターンはどちらか一方しか選べない。
+// 手札上限・山札切れといった絶対条件を先に処理し、それ以外は
+// 「手札の余裕」「今すぐ使える魂があるか」「あと少しの魂で出したい強いカードがあるか」
+// などから判断する。僅差の場合は少しランダム性を持たせ、毎回同じ判断にしない。
+function enemyChooseDrawOrScavenge(){
+  if(state.enemy.hand.length >= HAND_LIMIT) return 'scavenge'; // 手札上限を超えてドローはできない
+  if(state.enemy.deck.length === 0) return 'scavenge'; // 山札切れ(=敗北)を避ける
+
+  const soul = state.enemy.soul;
+  const hand = state.enemy.hand;
+  const hasEmptySlot = state.enemy.field.some((c,idx)=>!c && rowOf(idx)==='back');
+  const affordableNow = hand.some(c=>c.soul<=soul);
+  const nearAffordable = hand.some(c=>c.soul===soul+1 && (c.atk+c.hp)>=3);
+  // 手札に強力な切り札級のカードがあり、あと2〜3ターン分の魂を貯めれば出せる場合は、
+  // 今すぐの展開より魂を貯めることを優先する(cardPowerで能力込みの強さを見る)
+  const buildingForBomb = hand.some(c=>c.soul>soul+1 && c.soul<=soul+3 && cardPower(c)>=5.5);
+
+  let scoreDraw = 0;
+  let scoreScavenge = 0;
+
+  if(hand.length<=1) scoreDraw += 3;          // 手札が少ない→次の行動にカードが必要
+  if(hand.length>=4) scoreScavenge += 2;      // 手札はもう十分ある
+  if(!hasEmptySlot) scoreScavenge += 1;       // 場が埋まっていてどうせ今は出せない
+  if(!affordableNow && hand.length>0) scoreScavenge += 1; // 今召喚できるカードがない
+  if(affordableNow) scoreDraw += 1;           // 召喚できるカードは既にある
+  if(nearAffordable) scoreScavenge += 3;      // あと少しの魂で強いカードが出せる
+  if(buildingForBomb) scoreScavenge += 1.5;   // 切り札のために魂を計画的に貯める
+  if(soul<=1) scoreScavenge += 1;             // 魂が足りていない
+
+  // 僅差なら固定行動にならないよう軽くランダム性を混ぜる
+  scoreDraw += Math.random()*0.6;
+  scoreScavenge += Math.random()*0.6;
+
+  return scoreScavenge>scoreDraw ? 'scavenge' : 'draw';
+}
+
+function enemyDrawPhase(){
+  const choice = enemyChooseDrawOrScavenge();
+
+  if(choice==='draw'){
+    if(state.enemy.deck.length===0){
+      return { deckout:true }; // 保険(enemyChooseDrawOrScavengeで基本的に回避済み)
+    }
+    state.enemy.hand.push(state.enemy.deck.pop());
+    log('敵が1枚ドロー');
+  }else{
+    state.enemy.soul += 1;
+    log('敵が死体を漁って魂を1獲得');
+  }
+  return { deckout:false };
+}
+
+// ---- 召喚するカード×レーンの組を評価する ----
+// atk/hp/コストといった数値だけでなく、能力・自分と相手双方の場・双方のHPなどを見て
+// 「この状況ならこのカードをこのレーンに出す価値が高い」をスコアとして表す。
+function evaluateSummonOption(card, lane){
+  let score = card.atk + card.hp*0.5;
+
+  const enemyFront = state.player.field[frontIndex(lane)]; // AIから見た「相手」= プレイヤー
+  const ownFieldCountNow = fieldCount(state.enemy);
+
+  if(hasAbility(card,'守護')){
+    const flyingLanes = flyingThreatLanes(state.enemy, state.player);
+    if(flyingLanes.includes(lane)) score += 4; // 相手の飛行を止められるレーンは特に価値が高い
+    else score += 0.5;
+    if(enemyFront) score += 1; // 正面に敵がいるなら盾として機能しやすい
+  }
+
+  if(hasAbility(card,'身代わり')){
+    score += 3; // レーンを問わず直接攻撃を肩代わりできるので、守護よりさらに場に出す価値が高い
+    if(hasAbility(card,'守護') && flyingThreatLanes(state.enemy, state.player).length){
+      score += 3; // 守護も併せ持つなら、飛行まで全レーンでブロックできる
+    }
+  }
+
+  if(hasAbility(card,'毒')){
+    // 通常攻撃では倒しにくい(HPが高い)相手の正面に出す価値が高い
+    if(enemyFront && enemyFront.currentHp >= 3) score += 3;
+    else if(enemyFront) score += 1;
+  }
+
+  if(hasAbility(card,'貫通')){
+    // 正面のHPが低い(倒した上で余剰ダメージが出やすい)、または正面が空だと価値が高い
+    if(enemyFront && enemyFront.currentHp <= card.atk) score += 2.5;
+    else if(!enemyFront) score += 1.5;
+  }
+
+  if(hasAbility(card,'飛行')){
+    // 正面に守護がいなくても、相手が「身代わり」+「守護」持ちを他レーンに出していれば
+    // 直接攻撃にはならないので、その場合は加点しない。
+    const globalFlyingBlock = frontRowAbilityHolder(state.player, '身代わり', true);
+    if((!enemyFront || !hasAbility(enemyFront,'守護')) && !globalFlyingBlock) score += 2.5; // 直接攻撃を狙える
+  }
+
+  if(hasAbility(card,'2連撃')){
+    score += 1.5;
+    if(!enemyFront) score += 1; // 直接攻撃なら2回分そのままダメージになる
+  }
+
+  // 以下は「どのレーンに出すか」にはあまり関係しないが、これまで評価に反映されておらず
+  // AIがカード自体の価値を見落としがちだった能力。cardPower(生け贄選定用)には既に
+  // 反映済みだったが、召喚の優先度にも同様に反映することでAIをより賢くする。
+  if(hasAbility(card,'装甲')) score += 1;     // ダメージを受けにくく場に長く残りやすい
+  if(hasAbility(card,'不死')) score += 1.3;   // 実質2回分の体力として扱える
+  if(hasAbility(card,'魂収集')) score += 0.5; // 相打ちになっても魂を多く得られる
+  if(hasAbility(card,'供物')) score += 0.4;   // 後で生け贄にする時に価値が高く、柔軟に使える
+  if(hasAbility(card,'魂喰らい')){
+    // 正面の相手を倒せそうなら魂を稼げるチャンスが大きい
+    if(enemyFront && card.atk>=enemyFront.currentHp) score += 1.5;
+    else score += 0.6;
+  }
+  if(hasAbility(card,'知識')) score += 1.2; // 出すだけで手札が増える、召喚を後回しにする理由がない
+  if(hasAbility(card,'断末魔')) score += 1; // 壁として使って死んでもカード1枚分は回収できる
+
+  if(state.player.hp <= 6) score += card.atk*0.5; // 相手の残りHPが少ない時は火力を重視
+  if(state.enemy.hp <= 8 && hasAbility(card,'守護')) score += 1.5; // 自分が押されている時は守護を優先
+
+  // 自分のHPが低い時、または相手が強いモンスター(攻撃力が高い・能力が強力)を出している時は、
+  // 殴り合いより除去を最優先にする
+  if(enemyFront){
+    const selfPressured = state.enemy.hp <= 10;
+    const bigThreat = cardPower(enemyFront) >= 5; // 攻撃力or能力込みで強い相手
+    if(selfPressured || bigThreat){
+      const wouldKill = hasAbility(card,'毒') ? card.atk>0 : card.atk>=enemyFront.currentHp;
+      if(wouldKill) score += (selfPressured && bigThreat) ? 4 : 2.5; // 両方当てはまるなら特に急ぐ
+      else if(hasAbility(card,'守護')) score += 1; // 倒せないなら守護で足止め
+    }
+  }
+
+  if(ownFieldCountNow===0) score += 1; // 場が空なら展開を優先
+
+  return score;
+}
+
+// ---- 生け贄選び(AI専用) ----
+// HPだけでなく能力(守護・毒など)や、すでに攻撃準備ができているかも考慮し、
+// 「生け贄の価値1あたり、失う強さが小さいカード」から優先して選ぶ。
+// 「供物」は1体で生け贄2体分になるルールはそのまま(sacrificeUnitValueを利用)。
+function pickSacrificesForAI(owner, excludeIndex, neededValue){
+  const candidates = fieldSlots(owner).filter(o=>o.index!==excludeIndex);
+
+  const scored = candidates.map(o=>{
+    const c = o.c;
+    let keep = cardPower(c);
+    if(rowOf(o.index)==='front' && !c.summonedThisTurn) keep += 1.5; // 攻撃に参加できるカードは残す価値が高い
+    // 魂コストが高いカードほど再展開のコストが重いので、生け贄に選びにくくする
+    // (魂1のカードはすぐ出し直せるので、生け贄に回っても損が小さい)
+    if(c.soul>=2) keep += c.soul * 1.5;
+    const unit = sacrificeUnitValue(c);
+    return { o, unit, costPerValue: keep/unit };
+  });
+
+  scored.sort((a,b)=>a.costPerValue-b.costPerValue);
+
+  const chosen = [];
+  let value = 0;
+  for(const s of scored){
+    if(value>=neededValue) break;
+    chosen.push(s.o);
+    value += s.unit;
+  }
+  return { chosen, value, enough: value>=neededValue };
+}
+
+function enemyMainPhase(){
+  const drawResult = enemyDrawPhase();
+  if(drawResult.deckout) return { deckout:true };
+
+  // 場の空き(最大MAX_FIELD_CARDS体)で自然に終わるが、念のため上限回数も設けて無限ループを防ぐ
+  let safety = 0;
+  while(safety++ < 20){
+    // AIも2列目(召喚エリア)にしか召喚できない
+    const emptySlots = state.enemy.field
+      .map((c,index)=>({c,index}))
+      .filter(x=>!x.c && rowOf(x.index)==='back');
+    if(!emptySlots.length) break;
+
+    // 召喚可能な(カード, レーン)の組をすべて集めて評価する
+    const options = [];
+    for(let i=0;i<state.enemy.hand.length;i++){
+      const c = state.enemy.hand[i];
+      if(c.type==='spell') continue; // 魔法カードは場に「召喚」するものではないので、この一覧には含めない
+      if(c.soul > state.enemy.soul) continue;
+
+      for(const target of emptySlots){
+        const lane = laneOf(target.index);
+        const pick = pickSacrificesForAI(state.enemy, target.index, c.sacrifice);
+        if(!pick.enough) continue;
+        // 生け贄で減る分を差し引いてから上限体数の制限を判定する(プレイヤーと同じ入れ替えルール)。
+        // 「不死」がまだ発動していないカードは場に残る(復活する)ので、実際に離脱する枚数だけを引く。
+        const actualLeaving = pick.chosen.filter(item=>!(hasAbility(item.c,'不死') && !item.c.revived)).length;
+        const projectedCount = fieldCount(state.enemy) - actualLeaving + 1;
+        if(projectedCount > MAX_FIELD_CARDS) continue;
+
+        let score = evaluateSummonOption(c, lane);
+        if(c.id==='necromancer' && projectedCount < MAX_FIELD_CARDS) score += 1.5; // スケルトンも一緒に出せる
+        // 生け贄で失う戦力が大きいほど評価を下げる(価値の高いカードを無駄に失わない)
+        score -= pick.chosen.reduce((sum,item)=>sum+cardPower(item.c),0) * 0.5;
+
+        options.push({ handIndex:i, slot:target.index, card:c, pick, score });
+      }
+    }
+
+    if(!options.length) break;
+
+    // 最も評価の高い選択肢の近くに複数候補があれば、その中から少しランダムに選ぶ
+    // (状況が同じでも毎回まったく同じ行動にならないようにするため)
+    options.sort((a,b)=>b.score-a.score);
+    const top = options[0].score;
+    const nearTop = options.filter(o=>o.score >= top-0.75);
+    const chosenOption = nearTop[Math.floor(Math.random()*nearTop.length)];
+    const { handIndex, slot, card, pick } = chosenOption;
+
+    if(card.sacrifice>0){
+      const names=[];
+      pick.chosen.forEach(item=>{
+        if(hasAbility(item.c, '不死') && !item.c.revived){
+          item.c.currentHp = item.c.hp;
+          item.c.revived = true;
+          log(`敵が「${item.c.name}」を生け贄に捧げたが、不死が発動して場に残った`);
+        }else{
+          state.enemy.field[item.index]=null;
+          state.enemy.grave.push(item.c);
+          const soulAmount = gainSoulOnDeath(item.c, state.enemy);
+          triggerOnDeath(item.c, state.enemy, item.index);
+          names.push(item.c.name);
+          log(`敵の生け贄「${item.c.name}」で魂+${soulAmount}`);
+        }
+      });
+      if(names.length) log(`敵が「${names.join('」「')}」を生け贄に捧げた`);
+    }
+
+    state.enemy.soul -= card.soul;
+    state.enemy.hand.splice(handIndex,1);
+    card._summonedAt = Date.now();
+    state.enemy.field[slot]=card;
+    log(`敵が「${card.name}」を${rowOf(slot)==='back'?'2列目':'1列目'}に召喚`);
+    playSound('summon');
+    triggerOnSummon(card,state.enemy,slot);
+  }
+
+  enemyTryCastSpells();
+
+  return {deckout:false};
+}
+
+// ---- 魔法カードの使用(AI専用) ----
+// モンスターを並べ終えた後、余った魂で使えそうな魔法があれば使う。
+// 込み入った最適化はせず、「確実に得になる」場面だけを狙う単純な判断にとどめる。
+function enemyTryCastSpells(){
+  let changed = true;
+  let guard = 0;
+  while(changed && guard++ < 10){
+    changed = false;
+    for(let i=0;i<state.enemy.hand.length;i++){
+      const card = state.enemy.hand[i];
+      if(card.type!=='spell') continue;
+      if(card.soul > state.enemy.soul) continue;
+
+      if(card.effect==='damage'){
+        // このダメージで倒せる、なるべく強い相手のモンスターを狙う
+        let bestSlot=-1, bestPower=-1;
+        fieldSlots(state.player).forEach(({c,index})=>{
+          let dmg = card.value;
+          if(hasAbility(c,'装甲')) dmg = Math.max(0, dmg-1);
+          if(dmg>0 && dmg>=c.currentHp){
+            const p = cardPower(c);
+            if(p>bestPower){ bestPower=p; bestSlot=index; }
+          }
+        });
+        if(bestSlot<0) continue;
+        if(applySpellEffect(card, state.enemy, state.player, bestSlot)){
+          state.enemy.soul -= card.soul;
+          state.enemy.hand.splice(i,1);
+          changed = true; break;
+        }
+        continue;
+      }
+
+      if(card.effect==='buff'){
+        // 場の中で一番活躍しそうな(強い)モンスターを強化する
+        const slots = fieldSlots(state.enemy);
+        if(!slots.length) continue;
+        slots.sort((a,b)=>cardPower(b.c)-cardPower(a.c));
+        if(applySpellEffect(card, state.enemy, state.player, slots[0].index)){
+          state.enemy.soul -= card.soul;
+          state.enemy.hand.splice(i,1);
+          changed = true; break;
+        }
+        continue;
+      }
+
+      if(card.effect==='rush'){
+        // 2列目にいて、対応する1列目が空いている(=今すぐ攻撃に参加させられる)モンスターを探す
+        const candidates = fieldSlots(state.enemy).filter(({index})=>{
+          if(rowOf(index)!=='back') return false;
+          return !state.enemy.field[frontIndex(laneOf(index))];
+        });
+        if(!candidates.length) continue;
+        candidates.sort((a,b)=>cardPower(b.c)-cardPower(a.c));
+        if(applySpellEffect(card, state.enemy, state.player, candidates[0].index)){
+          state.enemy.soul -= card.soul;
+          state.enemy.hand.splice(i,1);
+          changed = true; break;
+        }
+        continue;
+      }
+
+      if(card.effect==='soulGain'){
+        // 他に召喚できる手札が残っているならそちらに魂を残し、使い道が無い時だけ使う
+        const canSummonSomething = state.enemy.hand.some(c=>c.type!=='spell' && c.soul<=state.enemy.soul);
+        if(canSummonSomething) continue;
+        if(applySpellEffect(card, state.enemy, state.player, -1)){
+          state.enemy.soul -= card.soul;
+          state.enemy.hand.splice(i,1);
+          changed = true; break;
+        }
+      }
+    }
+  }
+}
+
+// ---- 攻撃の処理順について ----
+// 以前は「確実に倒せる攻撃」などを優先する順番替えロジックがあったが、
+// 「身代わり」のようにレーンをまたいで攻撃が誘導される能力が増えたことで、
+// 優先順位で並べ替えるとログや盤面演出上「どのレーンの攻撃が今どこに当たっているか」が
+// 分かりにくくなってしまう。そのため攻撃は常にレーン0→1→2→3の左から右の順で処理する。
+// プレイヤーの攻撃・対人戦でのゲストの攻撃も元々この順番だったので、
+// これで全ての攻撃フェイズ(プレイヤー・AI・対人戦ゲスト)が統一される。
+// ==================== ターン進行 ====================
+// 1列目のモンスターが総攻撃するフェイズの共通処理。
+// プレイヤー攻撃・敵攻撃のどちらでも同じルールを1箇所にまとめることで、
+// 処理が二重に存在してズレてしまうバグを防ぐ。
+// 攻撃側の場のオーナー(attackerOwner)・防御側の場のオーナー(defenderOwner)に加えて、
+// 直接攻撃時のログ文言と、防御側のHPが0になった時の決着(win/lose)を渡す。
+// 決着がついた場合はtrueを返すので、呼び出し側はそこで処理を打ち切ること。
+function resolveAttackPhase(attackerOwner, defenderOwner, directHitLog, loseResultForDefender){
+  const order = [0,1,2,3]; // 常にレーン0→3の左から右の順で処理する(理由は関数の上のコメント参照)
+  for(const lane of order){
+    const atk=attackerOwner.field[frontIndex(lane)];
+    if(!atk) continue;
+    if(atk.summonedThisTurn) continue; // 移動できずまだ2列目相当で待機中のはずの保険チェック
+
+    for(let hit=0;hit<attackCount(atk);hit++){
+      const target=targetForAttack(defenderOwner,lane,hasAbility(atk,'飛行'));
+      if(target && target.card){
+        battle(atk,attackerOwner,target.card,defenderOwner,target.index);
+      }else{
+        defenderOwner.hp-=atk.atk;
+        log(directHitLog(atk));
+      }
+      playSound('attack');
+      if(defenderOwner.hp<=0){
+        endGame(loseResultForDefender);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+// プレイヤーの「ターン終了」ボタンで呼ばれる。プレイヤーの攻撃までを処理したら
+// 「敵のターン」の表示を挟んでから敵の処理(runEnemyTurn)に続ける。
+function endTurn(){
+  if(NET.mode==='guest'){
+    if(state.locked || state.phase!=='main' || state.pendingSkeleton==='player') return;
+    netSend({t:'endTurn'});
+    return;
+  }
+  if(state.locked) return;
+  if(NET.mode==='host' && state.active!=='player') return; // 対人戦: ゲストのターン中はホストのターン終了を禁止
+  if(state.pendingSkeleton==='player') return; // スケルトンの配置待ち中はターンを終了できない
+  if(state.phase!=='main'){
+    toast('ドローかスカベンジを先に行ってください');
+    return;
+  }
+  state.locked=true;
+
+  // 召喚エリア(2列目)のモンスターは召喚したターンには攻撃エリアへ移動しない。
+  // 移動は次に自分のターンが回ってきた時(runEnemyTurンの終わり)にのみ行われるので、
+  // ここでは呼ばない。ターン終了時はあくまで「今すでに攻撃エリアにいるモンスター」だけが攻撃する。
+
+  const ended = resolveAttackPhase(
+    state.player, state.enemy,
+    atk => hasAbility(atk,'飛行') ? `「${atk.name}」が敵プレイヤーに直接攻撃` : `「${atk.name}」が敵プレイヤーを攻撃`,
+    'win'
+  );
+  if(ended){ state.locked=false; return; }
+
+  if(NET.mode==='host'){
+    // 対人戦: AIの代わりに相手(ゲスト)の操作を待つ。
+    // ここで state.locked を false に戻さないと、net.js 側の
+    // pvpEnemyDraw/Scavenge/Summon/EndTurn が「処理中」と誤認して
+    // ゲストからの操作意図を永久に無視してしまう(=ゲストが死体を漁る/
+    // カードを召喚するボタンを押しても反応しないバグの原因)。
+    // ホスト自身の操作は下の render() 内のボタン disabled 判定と
+    // 各操作関数側の active チェックで別途止めているので、ここでは
+    // ロックを解除して問題ない。
+    //
+    // 【バグ修正】ここで advanceRow(state.enemy, ...) を呼んでいなかったため、
+    // ゲスト(=state.enemy)が前ターンに2列目へ召喚したモンスターが、
+    // 自分のターン開始時になっても1列目(攻撃エリア)へ移動しないバグがあった。
+    // シングルプレイのrunEnemyTurn()冒頭のadvanceRow(state.enemy,'敵')と同様の
+    // 処理をここでも行う。
+    state.active='enemy';
+    state.phase='draw';
+    state.locked=false;
+    advanceRow(state.enemy, '敵');
+    render();
+    showTurnBanner('相手のターン');
+    return;
+  }
+
+  render();
+  state.active='enemy';
+  showTurnBanner('敵のターン');
+  setTimeout(runEnemyTurn,800);
+}
+
+function runEnemyTurn(){
+  // 自分の攻撃で敵の1列目が空いた場合に備え、敵メインフェイズの前にも移動を試みる
+  // (「1列目が空いたら次のターン開始時に自動で移動する」ルール)
+  advanceRow(state.enemy, '敵');
+
+  const result=enemyMainPhase();
+  if(result && result.deckout){
+    log('敵の山札が切れた');
+    state.locked=false; endGame('win'); return;
+  }
+
+  // 敵が今ターン召喚したモンスターは、このターンの攻撃には参加させない
+  // (移動は次に敵のターンが回ってきた時、このrunEnemyTurnの冒頭でのみ行う)
+  render();
+
+  const ended = resolveAttackPhase(
+    state.enemy, state.player,
+    atk => `敵の「${atk.name}」が直接攻撃`,
+    'lose'
+  );
+  if(ended){ state.locked=false; return; }
+
+  state.turn++;
+  state.phase='draw';
+  state.active='player';
+  state.locked=false;
+  // 次のプレイヤーターン開始時、1列目が空いていれば2列目のモンスターを自動で移動
+  advanceRow(state.player, 'あなた');
+  render();
+  showTurnBanner('あなたのターン');
+}
+// atk(攻撃側)とdef(防御側)がそれぞれどちらの持ち主のカードかを明示して受け取ることで、
+// 死亡時に間違った場・墓地を操作してしまうバグを防ぐ。
+function battle(atk, atkOwner, def, defOwner, slot){
+  let atkDamage = atk.atk;
+
+  if(hasAbility(def, '装甲')){
+    atkDamage = Math.max(0, atkDamage - 1);
+  }
+
+  const beforeHp = def.currentHp;
+
+  if(hasAbility(atk, '毒') && atkDamage > 0){
+    def.currentHp = 0;
+  }else{
+    def.currentHp -= atkDamage;
+  }
+
+  if(hasAbility(atk, '貫通')){
+    const excess = atkDamage - beforeHp;
+    if(excess > 0){
+      if(defOwner===state.enemy) state.enemy.hp -= excess;
+      else state.player.hp -= excess;
+      log(`「${atk.name}」の貫通で${excess}ダメージ`);
+    }
+  }
+
+  if(def.currentHp<=0){
+    resolveDeath(def, defOwner, slot);
+    if(hasAbility(atk, '魂喰らい')){
+      atkOwner.soul += 1;
+      log(`「${atk.name}」の「魂喰らい」で${atkOwner===state.player?'あなた':'敵'}の魂+1`);
+    }
+    if(hasAbility(atk, '使役') && atk.reap){
+      const who = (atkOwner===state.player) ? 'あなた' : '敵';
+      if(atkOwner.hand.length < HAND_LIMIT){
+        const reaped = makeCard(atk.reap);
+        atkOwner.hand.push(reaped);
+        log(`「${atk.name}」の「使役」で${who}の手札に「${reaped.name}」が加わった`);
+      }else{
+        log(`「${atk.name}」の「使役」が発動したが、${who}の手札が上限のため不発`);
+      }
+    }
+  }
+}
+
+function hasAbility(card, ability){
+  return card && Array.isArray(card.abilities) && card.abilities.includes(ability);
+}
+
+// ==================== チュートリアル ====================
+// タイトル画面の「遊び方」ボタンから開く、ルール説明のページ送り式ガイド。
+// 実際のゲーム状態には一切触れず、静的な説明文とミニ図解だけで完結させることで、
+// 途中でゲーム本体のロジックに影響を与えないようにしている。
+const TUTORIAL_STEPS = [
+  {
+    title: "Soul Sacrificeへようこそ",
+    html: `
+      <p>プレイヤー同士がモンスターを召喚し合って戦うカードゲームです。</p>
+      <p>おたがいのHPは<b>20</b>から始まり、相手のHPを<b>0</b>にすれば勝利です。</p>
+      <p>このチュートリアルでは、基本的な遊び方を順番に説明します。「次へ」で進み、「戻る」でいつでも見直せます。</p>
+    `
+  },
+  {
+    title: "盤面の構成",
+    html: `
+      <p>場は横に並んだ<b>4つのレーン</b>があり、それぞれ<b>1列目(攻撃エリア)</b>と<b>2列目(召喚エリア)</b>に分かれています。</p>
+      <div class="tutorial-diagram field-row attack-row">
+        <div class="row-label">1列目：攻撃エリア</div>
+        <div class="lanes"><div class="lane">⚔️</div><div class="lane">⚔️</div><div class="lane">⚔️</div><div class="lane">⚔️</div></div>
+      </div>
+      <div class="tutorial-diagram field-row summon-row">
+        <div class="row-label">2列目：召喚エリア</div>
+        <div class="lanes"><div class="lane">➕</div><div class="lane">➕</div><div class="lane">➕</div><div class="lane">➕</div></div>
+      </div>
+      <p>モンスターが場に出せるのは最大<b>${MAX_FIELD_CARDS}体</b>までです。</p>
+    `
+  },
+  {
+    title: "ターンの流れ",
+    html: `
+      <ul>
+        <li>まず「デッキから引く」か「死体を漁る(魂+1)」のどちらか<b>1回だけ</b>行います</li>
+        <li>そのあとメインフェイズで、モンスターの召喚や魔法カードの使用ができます</li>
+        <li>最後に「ターン終了」を押すと、場のモンスターが攻撃してから相手のターンになります</li>
+      </ul>
+    `
+  },
+  {
+    title: "モンスターの召喚",
+    html: `
+      <p>手札のモンスターカードをタップして選び、<b>2列目(召喚エリア)</b>の空きマスをタップすると召喚できます。</p>
+      <p>モンスターは1列目には直接出せません。召喚したターンはまだ攻撃できず、次の自分のターンが来た時に1列目が空いていれば自動で移動して攻撃に参加できるようになります。</p>
+    `
+  },
+  {
+    title: "魂と生け贄",
+    html: `
+      <p>カードを召喚するには、多くの場合<b>魂</b>というコストが必要です。魂は「死体を漁る」で+1したり、モンスターが倒れた時にも手に入ります。</p>
+      <p>一部の強力なカードは魂に加えて<b>生け贄</b>が必要です。自分の場のモンスターをタップして生け贄に選んでから召喚してください。</p>
+      <p>手札の上限は<b>${HAND_LIMIT}枚</b>です。</p>
+    `
+  },
+  {
+    title: "戦闘のルール",
+    html: `
+      <p>ターン終了時、<b>1列目</b>にいるモンスターが同じレーンの相手モンスターを攻撃します。</p>
+      <p>相手の1列目が空いていれば、モンスターは相手プレイヤーに直接攻撃します(2列目のモンスターは攻撃の対象にはなりません)。</p>
+    `
+  },
+  {
+    title: "特殊能力について",
+    html: `
+      <p>モンスターには「飛行」「守護」「毒」「貫通」など、戦い方を大きく変える特殊能力を持つものがいます。</p>
+      <p>能力の詳しい説明は、ゲーム画面右上の「能力」ボタン(タイトル画面では「能力一覧」ボタン)からいつでも確認できます。</p>
+    `
+  },
+  {
+    title: "魔法カード",
+    html: `
+      <p>モンスターとは別に、場に残らず使った瞬間だけ効果を発揮する<b>魔法カード</b>もあります。</p>
+      <p>味方の強化・敵へのダメージ・魂の獲得など、状況に応じて手札から使いこなしましょう。</p>
+    `
+  },
+  {
+    title: "準備はできましたか？",
+    html: `
+      <p>ルール説明は以上です。あとは実際に対戦しながら覚えていくのが一番の近道です。</p>
+      <p>「AI対戦を始める」を押すと、デッキ編成画面からそのままAI対戦を始められます。</p>
+    `
+  }
+];
+let tutorialIndex = 0;
+
+function renderTutorial(){
+  const step = TUTORIAL_STEPS[tutorialIndex];
+  $('tutorial-progress').textContent = `${tutorialIndex+1} / ${TUTORIAL_STEPS.length}`;
+  $('tutorial-title').textContent = step.title;
+  $('tutorial-content').innerHTML = step.html;
+  $('btn-tutorial-prev').disabled = (tutorialIndex===0);
+  $('btn-tutorial-next').textContent = (tutorialIndex===TUTORIAL_STEPS.length-1) ? 'AI対戦を始める' : '次へ';
+}
+
+function openTutorial(){
+  tutorialIndex = 0;
+  renderTutorial();
+  show('tutorial-screen');
+}
+
+
+
+
+function attackCount(card){
+  return hasAbility(card, '2連撃') ? 2 : 1;
+}
+// ==================== イベント登録 ====================
+$('btn-start').onclick = () => {
+  initAudio();
+  NET.mode = 'local';
+  // 前回保存したデッキがあればそこから編成を始められるようにする(無ければおまかせ編成)
+  state.deckCounts = loadDeckFromStorage() || {...DEFAULT_DECK_COUNTS};
+  renderDeckBuilder();
+  show('deckbuilder-screen');
+};
+
+$('btn-start-saved').onclick = () => {
+  const counts = loadDeckFromStorage();
+  if(!counts){ toast('保存されたデッキがありません。まずデッキ編成画面で保存してください'); return; }
+  const ids = countsToDeckIds(counts);
+  if(ids.length < DECK_MIN_SIZE || ids.length > DECK_MAX_SIZE){
+    toast('保存されたデッキが現在のルールに合わないため使えません');
+    return;
+  }
+  initAudio();
+  NET.mode = 'local';
+  startGame(ids);
+};
+
+$('btn-pvp').onclick = () => {
+  initAudio();
+  pvpOpenScreen();
+};
+
+$('btn-tutorial').onclick = () => {
+  initAudio();
+  openTutorial();
+};
+
+$('btn-tutorial-prev').onclick = () => {
+  if(tutorialIndex>0){ tutorialIndex--; renderTutorial(); }
+};
+
+$('btn-tutorial-next').onclick = () => {
+  if(tutorialIndex < TUTORIAL_STEPS.length-1){
+    tutorialIndex++;
+    renderTutorial();
+  }else{
+    // 最終ステップ:タイトル画面の「AI対戦」ボタンと同じ処理でデッキ編成画面へ進む
+    $('btn-start').click();
+  }
+};
+
+$('btn-tutorial-skip').onclick = () => show('title-screen');
+
+$('btn-pvp-connect').onclick = () => {
+  const code = $('pvp-code-input').value;
+  pvpConnect(code);
+};
+
+$('btn-pvp-back').onclick = () => {
+  pvpResetToTitle();
+};
+
+$('btn-deck-reset').onclick = () => {
+  state.deckCounts = {...DEFAULT_DECK_COUNTS};
+  renderDeckBuilder();
+};
+
+$('btn-deck-save').onclick = () => {
+  const ok = saveDeckToStorage(state.deckCounts);
+  toast(ok ? 'デッキを保存しました' : '保存に失敗しました');
+};
+
+$('btn-deck-confirm').onclick = () => {
+  const ids = countsToDeckIds(state.deckCounts);
+  if(ids.length < DECK_MIN_SIZE || ids.length > DECK_MAX_SIZE) return;
+
+  if(NET.mode==='host'){
+    NET.myDeckIds = ids;
+    $('btn-deck-confirm').disabled = true;
+    pvpStatus('相手のデッキ確定を待っています…');
+    maybeStartPvPGame();
+  }else if(NET.mode==='guest'){
+    netSend({t:'deck', ids});
+    $('btn-deck-confirm').disabled = true;
+    pvpStatus('相手の準備を待っています…');
+  }else{
+    startGame(ids);
+  }
+};
+
+$('btn-draw').onclick=drawCard;
+$('btn-scavenge').onclick=scavenge;
+$('btn-end').onclick=endTurn;
+
+$('btn-result-title').onclick = () => {
+  if(NET.mode!=='local') pvpResetToTitle();
+  else show('title-screen');
+};
+
+$('btn-glossary-title').onclick = openGlossary;
+$('btn-glossary').onclick = openGlossary;
+$('btn-glossary-close').onclick = closeGlossary;
+
+
